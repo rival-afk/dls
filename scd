@@ -9,6 +9,23 @@ CACHE_DIR="$HOME/.cache/scd"
 mkdir -p "$CACHE_DIR"
 rm -f "$CACHE_DIR/meta.json" "$CACHE_DIR"/meta_cover*.jpg
 
+# --- самообновление с GitHub (отключается: DLS_UPDATE=0) ----------------------
+self_update() {
+    [ "${DLS_UPDATE:-1}" = "1" ] || return 0
+    local tmp="$CACHE_DIR/.update"
+    curl -fsSL --max-time 10 "https://raw.githubusercontent.com/rival-afk/dls/main/scd" -o "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+    [ -s "$tmp" ] && [ "$(head -c 2 "$tmp")" = "#!" ] || { rm -f "$tmp"; return 0; }
+    cmp -s "$tmp" "$0" && { rm -f "$tmp"; return 0; }
+    bash -n "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+    if mv "$tmp" "$0" 2>/dev/null; then
+        chmod 755 "$0" 2>/dev/null || true
+        echo "⟳ scd обновлён с GitHub — перезапускаюсь…"
+        exec env DLS_UPDATE=0 "$0" "$@"
+    fi
+    rm -f "$tmp"
+}
+self_update
+
 show_help() {
     cat <<'EOF'
 scd — загрузчик треков с SoundCloud
@@ -360,7 +377,7 @@ resolve_cover() {
         if [[ -f "$base.jpg" ]]; then
             raw="$base.jpg"
         else
-            raw=$(find "$PWD" -maxdepth 1 -name '*.jpg' -newer "$CACHE_DIR/.marker" -print 2>/dev/null | head -n 1 || true)
+            raw=$(new_covers | head -n 1 || true)
         fi
     fi
     [[ -n "$raw" && -f "$raw" ]] || return 0
@@ -375,15 +392,33 @@ resolve_cover() {
     fi
 }
 
+# Снапшот: какие jpg/webp лежат в папке до запуска yt-dlp (временные штампы —
+# ненадёжный способ: совпавшая с маркером секунда делает файл «не новее»).
+snapshot_covers() {
+    find "$PWD" -maxdepth 1 \( -name '*.jpg' -o -name '*.webp' \) -print 2>/dev/null | sort \
+        > "$CACHE_DIR/.covers_before"
+}
+
+# Обложки текущего запуска: появившиеся после снапшота (или новее маркера).
+new_covers() {
+    if [[ -f "$CACHE_DIR/.covers_before" ]]; then
+        find "$PWD" -maxdepth 1 \( -name '*.jpg' -o -name '*.webp' \) -print 2>/dev/null | sort \
+            | comm -13 "$CACHE_DIR/.covers_before" - 2>/dev/null
+        return 0
+    fi
+    [[ -f "$CACHE_DIR/.marker" ]] || return 0
+    find "$PWD" -maxdepth 1 \( -name '*.jpg' -o -name '*.webp' \) \
+        -newer "$CACHE_DIR/.marker" -print 2>/dev/null
+}
+
 clean_thumbnail() {
-    # обложки, записанные текущим запуском yt-dlp (новее маркера), — наши;
-    # после встраивания в файл они больше не нужны
+    # обложки текущего запуска после встраивания в файл не нужны — удаляем
     local f
     while IFS= read -r f; do
         [[ -n "$f" && "$f" != "${META_SRC_PATH:-}" ]] && rm -f "$f"
-    done < <(find "$PWD" -maxdepth 1 \( -name '*.jpg' -o -name '*.webp' \) \
-                 -newer "$CACHE_DIR/.marker" -print 2>/dev/null)
-    rm -f "$CACHE_DIR/meta_cover.jpg" "$CACHE_DIR/meta_cover_trimmed.jpg"
+    done < <(new_covers)
+    rm -f "$CACHE_DIR/meta_cover.jpg" "$CACHE_DIR/meta_cover_trimmed.jpg" \
+        "$CACHE_DIR/.covers_before"
 }
 
 locate_output() {
@@ -419,6 +454,7 @@ download_track() {
     fi
     [[ -f "$COOKIES_FILE" ]] && args+=(--cookies "$COOKIES_FILE")
     rm -f "$CACHE_DIR/.lastfile"
+    snapshot_covers
     touch "$CACHE_DIR/.marker"
     if ! yt-dlp "${args[@]}" "$url"; then
         echo "✖ Не удалось скачать (mp3): $url" >&2

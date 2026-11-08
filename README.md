@@ -33,7 +33,41 @@ curl -fsSL https://raw.githubusercontent.com/rival-afk/dls/main/install.sh | sh 
 - адаптирует шебанг скриптов под текущую систему (Termux → путь Termux, остальные → системный bash);
 - кладёт исполняемые файлы в `~/.local/bin` (переопределяется `INSTALL_DIR`) и добавляет её в `PATH` (bash/zsh/profile, fish).
 
-На Windows — через WSL или Git Bash (тем же curl-командой).
+На Windows — отдельный установщик (PowerShell), работает в cmd / PowerShell / Git Bash:
+
+```powershell
+irm https://raw.githubusercontent.com/rival-afk/dls/main/install.ps1 | iex
+```
+
+Без вопросов (с аргументами при запуске через `iex`):
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/rival-afk/dls/main/install.ps1))) ytd scd
+# или всё сразу:
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/rival-afk/dls/main/install.ps1))) all
+```
+
+Установщик сам:
+
+- кладёт скрипты в `~\.local\bin` (переопределяется `INSTALL_DIR`) и создаёт рядом лаунчеры `ytd.cmd` / `ttd.cmd` / `scd.cmd` — так из cmd/PowerShell команды запускаются, а не открываются в блокноте;
+- не находит Git Bash — качает PortableGit; качает `yt-dlp.exe`, `jq.exe`, `ffmpeg` (сборка BtbN) и embedded-python с официальных релизов (`jqlang`, `yt-dlp`, `BtbN/FFmpeg-Builds`, `python.org`);
+- добавляет `~\.local\bin` в пользовательский PATH и PATH для Git Bash (`~\.bashrc`).
+
+Переменные `INSTALL_DIR`, `APP_DIR`, `BRANCH` работают так же, как в шелл-установщике.
+
+## Автообновление
+
+Скрипты сами обновляются: при каждом запуске сверяются с GitHub (raw, ветка `main`) и, если есть новая версия, подменяют себя на свежую и перезапускаются уже обновлёнными. Отключается переменной `DLS_UPDATE=0`:
+
+```bash
+DLS_UPDATE=0 ytd <URL> 1
+```
+
+Офлайн обновление не сработает — просто ничего не произойдёт.
+
+## Прочее
+
+- Временные обложки (`.jpg`/`.webp`) скрипты после встраивания в файл удаляют сами; удаление точное — по «снимку» папки до скачивания, чужие картинки в текущей папке не трогаются.
 
 ## Использование
 

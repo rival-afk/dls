@@ -17,6 +17,23 @@ COOKIES_FILE="${TTD_COOKIES:-$HOME/projects/ttd/cookies.txt}"
 CACHE_DIR="$HOME/.cache/ttd"
 mkdir -p "$CACHE_DIR"
 
+# --- самообновление с GitHub (отключается: DLS_UPDATE=0) ----------------------
+self_update() {
+    [ "${DLS_UPDATE:-1}" = "1" ] || return 0
+    local tmp="$CACHE_DIR/.update"
+    curl -fsSL --max-time 10 "https://raw.githubusercontent.com/rival-afk/dls/main/ttd" -o "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+    [ -s "$tmp" ] && [ "$(head -c 2 "$tmp")" = "#!" ] || { rm -f "$tmp"; return 0; }
+    cmp -s "$tmp" "$0" && { rm -f "$tmp"; return 0; }
+    bash -n "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+    if mv "$tmp" "$0" 2>/dev/null; then
+        chmod 755 "$0" 2>/dev/null || true
+        echo "⟳ ttd обновлён с GitHub — перезапускаюсь…"
+        exec env DLS_UPDATE=0 "$0" "$@"
+    fi
+    rm -f "$tmp"
+}
+self_update
+
 # Провайдер режет хост коротких ссылок (vt./vm.tiktok.com) по TCP, при этом
 # сам www.tiktok.com и CDN доступны. Поэтому короткие ссылки резолвим в
 # канонический URL сторонним API (tikwm.com — не TikTok, блокировке не
@@ -109,8 +126,20 @@ embed_thumbnail() {
     return 1
 }
 
-# обложки, записанные текущим запуском yt-dlp (новее маркера)
+# Снапшот: какие jpg/webp лежат в папке до запуска yt-dlp.
+snapshot_covers() {
+    find "$PWD" -maxdepth 1 \( -name '*.jpg' -o -name '*.webp' \) -print 2>/dev/null | sort \
+        > "$CACHE_DIR/.covers_before"
+}
+
+# обложки, записанные текущим запуском yt-dlp (после снапшота;
+# если снапшота нет — старый путь: новее маркера)
 current_covers() {
+    if [[ -f "$CACHE_DIR/.covers_before" ]]; then
+        find "$PWD" -maxdepth 1 \( -name '*.jpg' -o -name '*.webp' \) -print 2>/dev/null | sort \
+            | comm -13 "$CACHE_DIR/.covers_before" - 2>/dev/null
+        return 0
+    fi
     [[ -f "$CACHE_DIR/.marker" ]] || return 0
     find "$PWD" -maxdepth 1 \( -name '*.jpg' -o -name '*.webp' \) \
         -newer "$CACHE_DIR/.marker" -print 2>/dev/null
@@ -122,6 +151,7 @@ clean_covers() {
     while IFS= read -r f; do
         [[ -n "$f" ]] && rm -f "$f"
     done < <(current_covers)
+    rm -f "$CACHE_DIR/.covers_before"
 }
 
 download_music() {
@@ -141,6 +171,7 @@ download_music() {
         -o '%(title)s.%(ext)s'
     )
     [[ -f "$COOKIES_FILE" ]] && args+=(--cookies "$COOKIES_FILE")
+    snapshot_covers
     touch "$CACHE_DIR/.marker"
     if ! yt-dlp "${args[@]}" "$url"; then
         echo "✖ Не удалось скачать (mp3): $url" >&2
@@ -193,6 +224,7 @@ download_video() {
         -o '%(title)s.%(ext)s'
     )
     [[ -f "$COOKIES_FILE" ]] && args+=(--cookies "$COOKIES_FILE")
+    snapshot_covers
     touch "$CACHE_DIR/.marker"
     if ! yt-dlp "${args[@]}" "$url"; then
         echo "✖ Не удалось скачать (mp4): $url" >&2
