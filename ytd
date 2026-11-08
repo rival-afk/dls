@@ -1,0 +1,617 @@
+#!/data/data/com.termux/files/usr/bin/bash
+#
+# ytd — загрузчик треков/видео с YouTube Music (см. ytd -h).
+# Файлы создаются в текущей папке: название, обложка, метаданные.
+
+set -euo pipefail
+
+CACHE_DIR="$HOME/.cache/ytd"
+mkdir -p "$CACHE_DIR"
+rm -f "$CACHE_DIR/meta.json" "$CACHE_DIR"/meta_cover*.jpg
+
+show_help() {
+    cat <<'EOF'
+ytd — загрузчик треков/видео с YouTube Music
+
+Использование:
+  ytd                       спросить URL, потом формат
+  ytd <URL>                 спросить формат
+  ytd <URL> 1               mp3 (аудио)
+  ytd <URL> 2               mp4 (видео)
+
+Флаги:
+  -m, --metadata <SRC>      название файла, теги и обложку взять из <SRC>
+                            (ссылка на YouTube, аудио/видеофайл или картинка)
+  -sb                       не вырезать немузыкальные сегменты
+  -h, --help                эта справка
+
+SponsorBlock (по умолчанию включён):
+  режим 1 (mp3)             вырезает всё немузыкальное: спонсоры, интро/аутро,
+                            напоминания и прочее — мешать слушать музыку нечему
+  режим 2 (mp4)             вырезает только спонсоров и напоминания
+                            о взаимодействии, сам клип не ломается
+  -sb                       отключает вырезание в обоих режимах
+
+  Используется только чтение: GET /api/skipSegments публичного API
+  https://sponsor.ajay.app (категории all / sponsor,interaction).
+  Ничего не отправляется и не голосуется. Если API недоступен,
+  скрипт предупредит и просто скачает файл без вырезания.
+
+Переменные окружения:
+  YTD_COOKIES               путь к cookies.txt для yt-dlp
+  YTD_SB_API                зеркало/адрес SponsorBlock API
+
+Примеры:
+  ytd https://youtu.be/xxxxxxx 1
+  ytd https://youtu.be/xxxxxxx 2 -m https://youtu.be/yyyyyyy
+  ytd https://youtu.be/xxxxxxx 1 -sb
+  ytd https://youtu.be/xxxxxxx 2 -m ./track.mp3
+
+Обложка обрезается от одноцветных полей по краям и встраивается в файл,
+после чего её временные файлы удаляются.
+EOF
+}
+
+is_playlist() {
+    local url="$1"
+    [[ "$url" =~ (list=|youtube\.com/playlist|music\.youtube\.com/playlist) ]]
+}
+
+COOKIES_FILE="${YTD_COOKIES:-$HOME/projects/ytd/cookies.txt}"
+SB_API="${YTD_SB_API:-https://sponsor.ajay.app}"
+SB_API_OK=""
+META_SRC_PATH=""
+
+fetch_playlist() {
+    local url="$1"
+    url="${url/music.youtube.com/youtube.com}"
+    local args=(
+        --flat-playlist -J
+        --js-runtimes node
+        --remote-components ejs:github
+        --extractor-args 'youtube:player_client=web_embedded'
+    )
+    [[ -f "$COOKIES_FILE" ]] && args+=(--cookies "$COOKIES_FILE")
+    yt-dlp "${args[@]}" "$url" 2>/dev/null
+}
+
+trim_thumbnail() {
+    local img="$1"
+    python3 -c "
+from PIL import Image
+import sys
+
+def is_solid(col_pixels, tol=3):
+    r0, g0, b0 = col_pixels[0]
+    return all(abs(r - r0) <= tol and abs(g - g0) <= tol and abs(b - b0) <= tol
+               for r, g, b in col_pixels)
+
+img = Image.open(sys.argv[1]).convert('RGB')
+px = img.load()
+w, h = img.size
+cols = [[px[x, y] for y in range(h)] for x in range(w)]
+
+left = 0
+while left < w:
+    if is_solid(cols[left]):
+        left += 1
+    else:
+        break
+
+right = w - 1
+while right > left:
+    if is_solid(cols[right]):
+        right -= 1
+    else:
+        break
+
+if left > 0 or right < w - 1:
+    img = img.crop((left, 0, right + 1, h))
+
+out = sys.argv[1].rsplit('.', 1)[0] + '_trimmed.jpg'
+img.save(out, 'JPEG', quality=95)
+print(out)
+" "$img"
+}
+
+has_meta() {
+    [[ -s "$CACHE_DIR/meta.json" ]]
+}
+
+meta_get() {
+    jq -r --arg k "$1" '.[$k] // empty' "$CACHE_DIR/meta.json" 2>/dev/null || true
+}
+
+meta_cover() {
+    if [[ -f "$CACHE_DIR/meta_cover.jpg" ]]; then
+        echo "$CACHE_DIR/meta_cover.jpg"
+    fi
+}
+
+rename_to_meta() {
+    local file="$1"
+    has_meta || { echo "$file"; return; }
+    local title
+    title=$(meta_get title)
+    [[ -n "$title" ]] || { echo "$file"; return; }
+
+    title="${title//\//}"
+    local dir ext target
+    dir=$(dirname "$file")
+    ext="${file##*.}"
+
+    # защита от "Название.mp3.mp3" / "Название.mp3.mp4":
+    # убираем любое медиа-расширение в конце названия
+    local media_ext='mp3|mp4|m4a|webm|opus|ogg|oga|flac|wav|aac|mkv|mov|avi|jpg|jpeg|png|webp'
+    if [[ "${title,,}" =~ \.($media_ext)$ ]]; then
+        title="${title%.*}"
+    fi
+    [[ -n "$title" ]] || { echo "$file"; return; }
+
+    target="$dir/$title.$ext"
+    if [[ "$target" == "$file" ]]; then
+        echo "$file"
+        return
+    fi
+    # не затираем сам файл-источник метаданных
+    if [[ -n "${META_SRC_PATH:-}" && "$target" == "$META_SRC_PATH" ]]; then
+        echo "$file"
+        return
+    fi
+    mv -f "$file" "$target" 2>/dev/null && echo "$target" || echo "$file"
+}
+
+finalize() {
+    local file="$1"
+    local cover="${2:-}"
+    local tmp="${file}.tmp.${file##*.}"
+    local -a md=()
+
+    if has_meta; then
+        local key src
+        for key in title artist album album_artist track genre; do
+            src=$(meta_get "$key")
+            [[ -n "$src" ]] && md+=(-metadata "$key=$src")
+        done
+        src=$(meta_get release_year)
+        [[ -n "$src" ]] && md+=(-metadata "date=$src")
+    fi
+
+    if [[ -n "$cover" && -f "$cover" && -f "$file" ]]; then
+        if [[ "${file##*.}" == "mp3" ]]; then
+            ffmpeg -y -i "$file" -i "$cover" \
+                -map 0:a -map 1:v -c:a copy -c:v copy \
+                -id3v2_version 3 -disposition:v:0 attached_pic \
+                -metadata:s:v title="Album cover" \
+                -metadata:s:v comment="Cover (front)" \
+                ${md[@]+"${md[@]}"} \
+                "$tmp" 2>/dev/null
+        else
+            ffmpeg -y -i "$file" -i "$cover" \
+                -map 0 -map 1 -c copy \
+                -disposition:v:1 attached_pic \
+                -metadata:s:v:1 title="Album cover" \
+                -metadata:s:v:1 comment="Cover (front)" \
+                ${md[@]+"${md[@]}"} \
+                "$tmp" 2>/dev/null
+        fi
+    elif [[ ${#md[@]} -gt 0 ]]; then
+        ffmpeg -y -i "$file" -c copy ${md[@]+"${md[@]}"} "$tmp" 2>/dev/null
+    else
+        return 0
+    fi
+
+    if [[ -f "$tmp" ]]; then
+        mv -f "$tmp" "$file"
+    else
+        rm -f "$tmp"
+    fi
+}
+
+meta_from() {
+    local src="$1"
+    local out="$CACHE_DIR/meta.json"
+    local cover="$CACHE_DIR/meta_cover.jpg"
+    rm -f "$out" "$cover"
+
+    if [[ -f "$src" ]]; then
+        ffprobe -v quiet -print_format json -show_format "$src" 2>/dev/null \
+            | jq '{
+                title: .format.tags.title,
+                artist: .format.tags.artist,
+                album: .format.tags.album,
+                album_artist: .format.tags.album_artist,
+                track: .format.tags.track,
+                release_year: .format.tags.date,
+                genre: .format.tags.genre
+            } | with_entries(select(.value != null and .value != ""))' > "$out"
+
+        ffmpeg -y -i "$src" -an -c:v copy "$cover" 2>/dev/null || rm -f "$cover"
+        if [[ -f "$cover" ]]; then
+            jq --arg c "$cover" '. + {thumbnail: $c}' "$out" > "$out.tmp" \
+                && mv "$out.tmp" "$out"
+        fi
+    else
+        local args=(
+            --skip-download -J
+            --js-runtimes node
+            --remote-components ejs:github
+            --extractor-args 'youtube:player_client=web_embedded'
+        )
+        [[ -f "$COOKIES_FILE" ]] && args+=(--cookies "$COOKIES_FILE")
+        yt-dlp "${args[@]}" "$src" 2>/dev/null | jq '{
+            title, artist, album, album_artist, track, track_number,
+            release_year, genre, thumbnail, thumbnails
+        } | with_entries(select(.value != null))' > "$out"
+
+        local thumb_url
+        thumb_url=$(jq -r '.thumbnail // (.thumbnails | last | .url) // empty' "$out" 2>/dev/null || true)
+        if [[ -n "$thumb_url" ]]; then
+            ffmpeg -y -i "$thumb_url" -frames:v 1 -q:v 2 "$cover" 2>/dev/null \
+                || curl -fsSL --max-time 30 "$thumb_url" -o "$cover" 2>/dev/null \
+                || rm -f "$cover"
+        fi
+    fi
+
+    [[ -s "$out" ]]
+}
+
+prepare_meta() {
+    local src="$1"
+    [[ -n "$src" ]] || return 1
+    if meta_from "$src"; then
+        return 0
+    fi
+    rm -f "$CACHE_DIR/meta.json" "$CACHE_DIR"/meta_cover*.jpg
+    return 1
+}
+
+dedupe_ext() {
+    local ext="$1"
+    local f
+    shopt -s nullglob
+    for f in *."$ext"."$ext"; do
+        mv -f "$f" "${f%."$ext"}"
+    done
+    shopt -u nullglob
+}
+
+sb_enabled() {
+    [[ "${SPONSORBLOCK:-1}" == "1" ]] || return 1
+    if [[ -z "$SB_API_OK" ]]; then
+        if curl -fsS --max-time 8 -o /dev/null "$SB_API/api/status" 2>/dev/null; then
+            SB_API_OK=1
+        else
+            SB_API_OK=0
+            echo "⚠ SponsorBlock API ($SB_API) недоступен — сегменты вырезать не буду" >&2
+        fi
+    fi
+    [[ "$SB_API_OK" == "1" ]]
+}
+
+resolve_cover() {
+    local raw=""
+    if has_meta; then
+        raw=$(meta_cover)
+    else
+        raw=$(find "$PWD" -maxdepth 1 -name '*.jpg' -newer "$CACHE_DIR/.marker" -print 2>/dev/null | head -n 1 || true)
+    fi
+    [[ -n "$raw" && -f "$raw" ]] || return 0
+
+    local trimmed
+    trimmed=$(trim_thumbnail "$raw" || true)
+    if [[ -n "$trimmed" && -f "$trimmed" ]]; then
+        rm -f "$raw"
+        printf '%s\n' "$trimmed"
+    elif [[ -f "$raw" ]]; then
+        printf '%s\n' "$raw"
+    fi
+}
+
+# Удаляет обложки текущего запуска: после встраивания в файл они не нужны.
+clean_covers() {
+    local f
+    while IFS= read -r f; do
+        [[ -n "$f" && "$f" != "${META_SRC_PATH:-}" ]] && rm -f "$f"
+    done < <(find "$PWD" -maxdepth 1 \( -name '*.jpg' -o -name '*.webp' \) \
+                 -newer "$CACHE_DIR/.marker" -print 2>/dev/null)
+    rm -f "$CACHE_DIR/meta_cover.jpg" "$CACHE_DIR/meta_cover_trimmed.jpg"
+}
+
+locate_output() {
+    local ext="$1"
+    local f=""
+
+    if [[ -f "$CACHE_DIR/.lastfile" ]]; then
+        f=$(grep -E "\.${ext}\$" "$CACHE_DIR/.lastfile" 2>/dev/null | tail -n 1 || true)
+    fi
+    if [[ -z "$f" || ! -f "$f" ]]; then
+        f=$(find "$PWD" -maxdepth 1 -name "*.${ext}" -newer "$CACHE_DIR/.marker" -print 2>/dev/null | head -n 1 || true)
+    fi
+    printf '%s\n' "$f"
+}
+
+download_track() {
+    local url="$1"
+    url="${url/music.youtube.com/youtube.com}"
+    echo
+    echo "▶ Скачиваю (mp3): $url"
+
+    local args=(
+        -x
+        --audio-format mp3
+        --audio-quality 0
+        --embed-metadata
+        --no-playlist
+        --newline
+        --js-runtimes node
+        --remote-components ejs:github
+        --extractor-args 'youtube:player_client=web_embedded'
+        --print-to-file after_move:filepath "$CACHE_DIR/.lastfile"
+        -o '%(title)s.%(ext)s'
+    )
+    if ! has_meta; then
+        args+=(--write-thumbnail --convert-thumbnails jpg)
+    fi
+    [[ -f "$COOKIES_FILE" ]] && args+=(--cookies "$COOKIES_FILE")
+    if sb_enabled; then
+        args+=("--sponsorblock-remove" "all" "--sponsorblock-api" "$SB_API")
+    fi
+    rm -f "$CACHE_DIR/.lastfile"
+    touch "$CACHE_DIR/.marker"
+    if ! yt-dlp "${args[@]}" "$url"; then
+        echo "✖ Не удалось скачать (mp3): $url" >&2
+        clean_covers
+        return 1
+    fi
+
+    local new
+    new=$(locate_output mp3)
+    if [[ -z "$new" ]]; then
+        clean_covers
+        echo "✓ Готово (mp3 в текущей папке)."
+        return
+    fi
+
+    if has_meta; then
+        new=$(rename_to_meta "$new")
+        dedupe_ext mp3
+        [[ -f "$new" ]] || new=$(locate_output mp3)
+        [[ -n "$new" && -f "$new" ]] || { clean_covers; echo "✓ Готово (mp3 в текущей папке)."; return; }
+    fi
+
+    local cover
+    cover=$(resolve_cover || true)
+    echo "▶ Встраиваю обложку и метаданные..."
+    finalize "$new" "$cover"
+    [[ -n "$cover" ]] && rm -f "$cover"
+    clean_covers
+    dedupe_ext mp3
+
+    echo "✓ Сохранено: $new"
+}
+
+download_video() {
+    local url="$1"
+    url="${url/music.youtube.com/youtube.com}"
+    echo
+    echo "▶ Скачиваю (mp4): $url"
+
+    local args=(
+        -f 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+        --merge-output-format mp4
+        --embed-metadata
+        --no-playlist
+        --newline
+        --js-runtimes node
+        --remote-components ejs:github
+        --extractor-args 'youtube:player_client=web_embedded'
+        --print-to-file after_move:filepath "$CACHE_DIR/.lastfile"
+        -o '%(title)s.%(ext)s'
+    )
+    if ! has_meta; then
+        args+=(--write-thumbnail --convert-thumbnails jpg)
+    fi
+    [[ -f "$COOKIES_FILE" ]] && args+=(--cookies "$COOKIES_FILE")
+    if sb_enabled; then
+        args+=("--sponsorblock-remove" "sponsor,interaction" "--sponsorblock-api" "$SB_API")
+    fi
+    rm -f "$CACHE_DIR/.lastfile"
+    touch "$CACHE_DIR/.marker"
+    if ! yt-dlp "${args[@]}" "$url"; then
+        echo "✖ Не удалось скачать (mp4): $url" >&2
+        clean_covers
+        return 1
+    fi
+
+    local new
+    new=$(locate_output mp4)
+    if [[ -z "$new" ]]; then
+        clean_covers
+        echo "✓ Готово (mp4 в текущей папке)."
+        return
+    fi
+
+    if has_meta; then
+        new=$(rename_to_meta "$new")
+        dedupe_ext mp4
+        [[ -f "$new" ]] || new=$(locate_output mp4)
+        [[ -n "$new" && -f "$new" ]] || { clean_covers; echo "✓ Готово (mp4 в текущей папке)."; return; }
+    fi
+
+    local cover
+    cover=$(resolve_cover || true)
+    echo "▶ Встраиваю обложку и метаданные..."
+    finalize "$new" "$cover"
+    [[ -n "$cover" ]] && rm -f "$cover"
+    clean_covers
+    dedupe_ext mp4
+
+    echo "✓ Сохранено: $new"
+}
+
+ask_format() {
+    {
+        echo "Выбери формат:"
+        echo "  1 — mp3 (аудио)"
+        echo "  2 — mp4 (видео)"
+        printf "Твой выбор [1/2]: "
+    } > /dev/tty
+    read -r format_choice < /dev/tty || true
+    case "$format_choice" in
+        2) echo "mp4" ;;
+        *) echo "mp3" ;;
+    esac
+}
+
+download() {
+    local url="$1"
+    local format="${2:-}"
+    
+    if [[ -z "$format" ]]; then
+        format=$(ask_format)
+    fi
+    
+    local download_fn="download_track"
+    [[ "$format" == "mp4" ]] && download_fn="download_video"
+
+    if is_playlist "$url" && has_meta; then
+        echo "⚠ -m не применяется к плейлисту (все треки получили бы одно имя)," >&2
+        echo "  скачиваю с обычными метаданными" >&2
+rm -f "$CACHE_DIR/meta.json" "$CACHE_DIR"/meta_cover*.jpg
+    fi
+
+    if is_playlist "$url"; then
+        echo
+        echo "▶ Обнаружен плейлист, получаю список треков..."
+        local json
+        json=$(fetch_playlist "$url") || {
+            echo "✖ Не удалось получить плейлист"
+            return 1
+        }
+        
+        local count
+        count=$(echo "$json" | jq '.entries | length' 2>/dev/null || echo 0)
+        
+        if [[ "$count" -eq 0 ]]; then
+            echo "✖ Плейлист пуст или недоступен"
+            return 1
+        fi
+        
+        echo "▶ Найдено треков: $count"
+        echo
+        
+        local i=1 ok=0 fail=0
+        while IFS=$'\t' read -r id title track_url; do
+            if [[ -z "$track_url" ]]; then
+                track_url="https://www.youtube.com/watch?v=$id"
+            fi
+            echo "[$i/$count] $title"
+            if $download_fn "$track_url"; then
+                ok=$((ok + 1))
+            else
+                fail=$((fail + 1))
+                echo "⚠ Пропущен: $title" >&2
+            fi
+            i=$((i + 1))
+        done < <(echo "$json" | jq -r '.entries[] | "\(.id)\t\(.title)\t\(.url // .webpage_url)"' 2>/dev/null)
+
+        echo
+        if (( fail > 0 )); then
+            echo "✓ Плейлист: загружено $ok из $count (пропущено $fail)"
+        else
+            echo "✓ Плейлист загружен: $count треков"
+        fi
+    else
+        $download_fn "$url"
+    fi
+}
+
+resolve_format() {
+    case "${1:-}" in
+        1) echo "mp3" ;;
+        2) echo "mp4" ;;
+        *) echo "" ;;
+    esac
+}
+
+if (( $# >= 1 )); then
+    url=""
+    fmt=""
+    meta_src=""
+
+    while (( $# > 0 )); do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -sb)
+                SPONSORBLOCK=0
+                shift
+                ;;
+            -m|--metadata)
+                if (( $# < 2 )); then
+                    echo "✖ После $1 нужен источник метаданных (URL или файл)" >&2
+                    exit 1
+                fi
+                meta_src="$2"
+                shift 2
+                ;;
+            1|2)
+                if [[ -n "$fmt" ]]; then
+                    echo "✖ Формат указан дважды (можно только 1 или 2)" >&2
+                    exit 1
+                fi
+                fmt=$(resolve_format "$1")
+                shift
+                ;;
+            -*)
+                echo "✖ Неизвестный флаг: $1" >&2
+                exit 1
+                ;;
+            *)
+                if [[ -n "$url" ]]; then
+                    echo "✖ Лишний аргумент: $1" >&2
+                    exit 1
+                fi
+                url="$1"
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$url" ]]; then
+        echo "✖ Укажи URL: ytd <URL> [1|2] [-m <SRC>] [-sb]" >&2
+        echo "  (ytd -h — подробная справка)" >&2
+        exit 1
+    fi
+
+    if [[ -n "$meta_src" ]]; then
+        if [[ -f "$meta_src" ]]; then
+            META_SRC_PATH="$(cd "$(dirname "$meta_src")" && pwd)/$(basename "$meta_src")"
+        fi
+        echo "▶ Беру метаданные и обложку из: $meta_src"
+        if ! prepare_meta "$meta_src"; then
+            echo "✖ Не удалось получить метаданные, продолжаю без них" >&2
+        fi
+    fi
+
+    download "$url" "$fmt"
+    exit 0
+fi
+
+echo "ytd — загрузчик треков/видео с YouTube Music (mp3/mp4 + обложка + метаданные)"
+echo "Пустая строка — выход. Ctrl+C — прервать загрузку."
+echo
+
+while :; do
+    printf 'Вставь URL: '
+    read -r url || true
+    url="${url//[$'\r\n']/}"
+    if [[ -z "$url" ]]; then
+        echo "Пока!"
+        exit 0
+    fi
+    download "$url"
+done

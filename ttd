@@ -1,0 +1,313 @@
+#!/data/data/com.termux/files/usr/bin/bash
+#
+# ttd — загрузчик треков/видео с TikTok.
+# Файлы создаются в папке, из которой запущена команда (не в папке скрипта),
+# с названием и метаданными как на TikTok.
+#
+# Использование:
+#   ttd                    # спросит URL и формат
+#   ttd <URL>              # спросит формат (1/2)
+#   ttd <URL> 1            # mp3 (музыка)
+#   ttd <URL> 2            # mp4 (видео)
+
+set -euo pipefail
+
+COOKIES_FILE="${TTD_COOKIES:-$HOME/projects/ttd/cookies.txt}"
+
+CACHE_DIR="$HOME/.cache/ttd"
+mkdir -p "$CACHE_DIR"
+
+# Провайдер режет хост коротких ссылок (vt./vm.tiktok.com) по TCP, при этом
+# сам www.tiktok.com и CDN доступны. Поэтому короткие ссылки резолвим в
+# канонический URL сторонним API (tikwm.com — не TikTok, блокировке не
+# подпадает); если API недоступен — используется исходный URL как есть.
+is_shortlink() {
+    case "$1" in
+        'http://vt.tiktok.com/'*|'https://vt.tiktok.com/'*|\
+        'http://vm.tiktok.com/'*|'https://vm.tiktok.com/'*|\
+        'http://m.tiktok.com/v/'*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+resolve_shortlink() {
+    local url="$1"
+    is_shortlink "$url" || { printf '%s\n' "$url"; return 0; }
+    local full
+    full=$(curl -sS --get --max-time 15 \
+        --data-urlencode "url=$url" \
+        'https://www.tikwm.com/api/' 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin).get("data") or {}
+    vid = str(d.get("id") or "")
+    uid = (d.get("author") or {}).get("unique_id") or ""
+    print("https://www.tiktok.com/@%s/video/%s" % (uid or "_", vid))
+except Exception:
+    pass
+' 2>/dev/null || true)
+    if [[ -n "$full" ]]; then
+        printf '%s\n' "$full"
+    else
+        echo '⚠ tikwm недоступен — пробую исходную ссылку' >&2
+        printf '%s\n' "$url"
+    fi
+}
+
+trim_thumbnail() {
+    local img="$1"
+    python3 -c "
+from PIL import Image
+import sys
+
+def is_solid(col_pixels, tol=3):
+    r0, g0, b0 = col_pixels[0]
+    return all(abs(r - r0) <= tol and abs(g - g0) <= tol and abs(b - b0) <= tol
+               for r, g, b in col_pixels)
+
+img = Image.open(sys.argv[1]).convert('RGB')
+px = img.load()
+w, h = img.size
+cols = [[px[x, y] for y in range(h)] for x in range(w)]
+
+left = 0
+while left < w:
+    if is_solid(cols[left]):
+        left += 1
+    else:
+        break
+
+right = w - 1
+while right > left:
+    if is_solid(cols[right]):
+        right -= 1
+    else:
+        break
+
+if left > 0 or right < w - 1:
+    img = img.crop((left, 0, right + 1, h))
+
+out = sys.argv[1].rsplit('.', 1)[0] + '_trimmed.jpg'
+img.save(out, 'JPEG', quality=95)
+print(out)
+" "$img"
+}
+
+embed_thumbnail() {
+    local audio="$1"
+    local thumb="$2"
+    local tmp="${audio}.tmp.mp3"
+    if ffmpeg -y -i "$audio" -i "$thumb" \
+        -map 0:a -map 1:v -c:a copy \
+        -metadata:s:v title="Album cover" \
+        -metadata:s:v comment="Cover (front)" \
+        "$tmp" 2>/dev/null; then
+        mv "$tmp" "$audio"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+# обложки, записанные текущим запуском yt-dlp (новее маркера)
+current_covers() {
+    [[ -f "$CACHE_DIR/.marker" ]] || return 0
+    find "$PWD" -maxdepth 1 \( -name '*.jpg' -o -name '*.webp' \) \
+        -newer "$CACHE_DIR/.marker" -print 2>/dev/null
+}
+
+# после встраивания обложки в файл её временные файлы удаляются
+clean_covers() {
+    local f
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && rm -f "$f"
+    done < <(current_covers)
+}
+
+download_music() {
+    local url="$1"
+    echo
+    echo "▶ Скачиваю (mp3): $url"
+
+    local args=(
+        -x
+        --audio-format mp3
+        --audio-quality 0
+        --write-thumbnail
+        --convert-thumbnails jpg
+        --embed-metadata
+        --no-playlist
+        --newline
+        -o '%(title)s.%(ext)s'
+    )
+    [[ -f "$COOKIES_FILE" ]] && args+=(--cookies "$COOKIES_FILE")
+    touch "$CACHE_DIR/.marker"
+    if ! yt-dlp "${args[@]}" "$url"; then
+        echo "✖ Не удалось скачать (mp3): $url" >&2
+        clean_covers
+        return 1
+    fi
+
+    local new
+    new=$(ls -t "$PWD"/*.mp3 2>/dev/null | head -n 1 || true)
+    if [[ -z "$new" ]]; then
+        # yt-dlp мог оставить только обложку (например, если mp3 не создался)
+        clean_covers
+        echo "✓ Готово (mp3 в текущей папке)."
+        return
+    fi
+
+    local f thumb=""
+    while IFS= read -r f; do
+        thumb="$f"
+        break
+    done < <(current_covers)
+    if [[ -n "$thumb" ]]; then
+        local trimmed
+        trimmed=$(trim_thumbnail "$thumb" || true)
+        if [[ -n "$trimmed" && -f "$trimmed" ]]; then
+            echo "▶ Встраиваю обложку..."
+            if ! embed_thumbnail "$new" "$trimmed"; then
+                echo "⚠ Не удалось встроить обложку: $new" >&2
+            fi
+        fi
+    fi
+    clean_covers
+
+    echo "✓ Сохранено: $new"
+}
+
+download_video() {
+    local url="$1"
+    echo
+    echo "▶ Скачиваю (mp4): $url"
+
+    local args=(
+        -f 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+        --merge-output-format mp4
+        --write-thumbnail
+        --convert-thumbnails jpg
+        --embed-metadata
+        --no-playlist
+        --newline
+        -o '%(title)s.%(ext)s'
+    )
+    [[ -f "$COOKIES_FILE" ]] && args+=(--cookies "$COOKIES_FILE")
+    touch "$CACHE_DIR/.marker"
+    if ! yt-dlp "${args[@]}" "$url"; then
+        echo "✖ Не удалось скачать (mp4): $url" >&2
+        clean_covers
+        return 1
+    fi
+
+    local new
+    new=$(ls -t "$PWD"/*.mp4 2>/dev/null | head -n 1 || true)
+    if [[ -z "$new" ]]; then
+        # yt-dlp мог оставить только обложку (например, если mp4 не создался)
+        clean_covers
+        echo "✓ Готово (mp4 в текущей папке)."
+        return
+    fi
+
+    local f thumb=""
+    while IFS= read -r f; do
+        thumb="$f"
+        break
+    done < <(current_covers)
+    if [[ -n "$thumb" ]]; then
+        local trimmed
+        trimmed=$(trim_thumbnail "$thumb" || true)
+        if [[ -n "$trimmed" && -f "$trimmed" ]]; then
+            echo "▶ Встраиваю обложку..."
+            local tmp="${new}.tmp.mp4"
+            if ffmpeg -y -i "$new" -i "$trimmed" \
+                -map 0 -map 1 -c copy \
+                -metadata:s:v title="Album cover" \
+                -metadata:s:v comment="Cover (front)" \
+                "$tmp" 2>/dev/null; then
+                mv "$tmp" "$new"
+            else
+                rm -f "$tmp"
+                echo "⚠ Не удалось встроить обложку: $new" >&2
+            fi
+        fi
+    fi
+    clean_covers
+
+    echo "✓ Сохранено: $new"
+}
+
+ask_format() {
+    {
+        echo "Выбери формат:"
+        echo "  1 — mp3 (музыка)"
+        echo "  2 — mp4 (видео)"
+        printf "Твой выбор [1/2]: "
+    } > /dev/tty
+    read -r format_choice < /dev/tty || true
+    case "$format_choice" in
+        2) echo "mp4" ;;
+        *) echo "mp3" ;;
+    esac
+}
+
+download() {
+    local url="$1"
+    local format="${2:-}"
+
+    # короткая ссылка (vt./vm.tiktok.com) может быть зарезана провайдером:
+    # переводим в каноническую https://www.tiktok.com/@user/video/<id>
+    if is_shortlink "$url"; then
+        echo "▶ Резолвлю короткую ссылку..."
+        url=$(resolve_shortlink "$url")
+        echo "▶ Ссылка: $url"
+    fi
+
+    if [[ -z "$format" ]]; then
+        format=$(ask_format)
+    fi
+    
+    local download_fn="download_music"
+    [[ "$format" == "mp4" ]] && download_fn="download_video"
+    
+    $download_fn "$url"
+}
+
+resolve_format() {
+    case "${1:-}" in
+        1) echo "mp3" ;;
+        2) echo "mp4" ;;
+        *) echo "" ;;
+    esac
+}
+
+if (( $# >= 1 )); then
+    case "$1" in
+        -h|--help)
+            sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+    esac
+    if (( $# >= 2 )); then
+        fmt=$(resolve_format "$2")
+        download "$1" "$fmt"
+    else
+        download "$1"
+    fi
+    exit 0
+fi
+
+echo "ttd — загрузчик треков/видео с TikTok (mp3/mp4 + обложка + метаданные)"
+echo "Пустая строка — выход. Ctrl+C — прервать загрузку."
+echo
+
+while :; do
+    printf 'Вставь URL: '
+    read -r url || true
+    url="${url//[$'\r\n']/}"
+    if [[ -z "$url" ]]; then
+        echo "Пока!"
+        exit 0
+    fi
+    download "$url"
+done
