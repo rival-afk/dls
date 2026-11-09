@@ -50,7 +50,7 @@ irm https://raw.githubusercontent.com/rival-afk/dls/main/install.ps1 | iex
 Установщик сам:
 
 - кладёт скрипты в `~\.local\bin` (переопределяется `INSTALL_DIR`) и создаёт рядом лаунчеры `ytd.cmd` / `ttd.cmd` / `scd.cmd` — так из cmd/PowerShell команды запускаются, а не открываются в блокноте;
-- не находит Git Bash — качает PortableGit; качает `yt-dlp.exe`, `jq.exe`, `ffmpeg` (сборка BtbN) и embedded-python с официальных релизов (`jqlang`, `yt-dlp`, `BtbN/FFmpeg-Builds`, `python.org`);
+- зависимости ищет в системе: bash (Git Bash — через `git` в PATH или стандартные места), `python3` — в PATH, если его нет, создаёт шим `python3`/`python3.cmd` поверх системного `python`; ffmpeg — в PATH или в `~\.local\share\dls\ffmpeg`; чего в системе не нашлось, скачает с официальных релизов (`jqlang`, `yt-dlp`, `BtbN/FFmpeg-Builds`, `git-for-windows`, `python.org`);
 - добавляет `~\.local\bin` в пользовательский PATH и PATH для Git Bash (`~\.bashrc`).
 
 Переменные `INSTALL_DIR`, `APP_DIR`, `BRANCH` работают так же, как в шелл-установщике.

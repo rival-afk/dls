@@ -1,8 +1,10 @@
-# install.ps1 — установщик dls на Windows (cmd / PowerShell), всё делает сам:
+﻿# install.ps1 — установщик dls на Windows (cmd / PowerShell), всё делает сам:
 #   - качает скрипты ytd/ttd/scd и создаёт .cmd-лаунчеры (иначе Windows
 #     открывает их в текстовом редакторе вместо запуска);
-#   - при отсутствии качает с интернета: Git или PortableGit (bash, чтобы
-#     исполнять скрипты), yt-dlp, jq, ffmpeg, python (embedded);
+#   - зависимости ищет в системе: bash (Git Bash через git в PATH или
+#     стандартные места), python3 (в PATH, либо системный python + shim python3);
+#     при отсутствии качает с интернета: PortableGit (bash), yt-dlp, jq,
+#     ffmpeg, python (embedded — только как запасной вариант);
 #   - добавляет ~/.local/bin в пользовательский PATH.
 #
 # Использование:
@@ -36,7 +38,7 @@ function Fetch([string]$url, [string]$dest) {
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $dest
-        return (Test-Path $dest)
+        return ((Test-Path $dest) -and ((Get-Item $dest).Length -gt 0))
     } catch { return $false }
 }
 
@@ -52,6 +54,21 @@ function Real-Exe([string]$name) {
     return $c.Source
 }
 
+function Test-Py3([string]$exe) {
+    # true, если exe — это рабочий python >= 3
+    try {
+        $v = & $exe -c "import sys; print(sys.version_info[0])" 2>$null
+        return ($LASTEXITCODE -eq 0 -and "$v".Trim() -eq '3')
+    } catch { return $false }
+}
+
+function Test-PyPIL([string]$exe) {
+    try {
+        & $exe -c "import PIL" 2>$null | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    } catch { return $false }
+}
+
 function Unblock([string]$path) { if (Test-Path $path) { Unblock-File $path -ErrorAction SilentlyContinue } }
 
 $IS_ARM64 = ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64')
@@ -65,7 +82,7 @@ function Ensure-Curl {
     }
 }
 
-# --- реальные утилиты -----------------------------------------------------------
+# --- утилиты -------------------------------------------------------------------
 
 function Deps-Jq {
     if (Test-Path "$INSTALL_DIR\jq.exe") { Ok 'jq установлен'; return }
@@ -106,20 +123,43 @@ function Deps-Ffmpeg {
     Get-ChildItem $bin.FullName -File | ForEach-Object { Move-Item $_.FullName "$APP_DIR\ffmpeg\" -Force }
     Remove-Item $tmp -Recurse -Force
     Unblock "$APP_DIR\ffmpeg\ffmpeg.exe"; Unblock "$APP_DIR\ffmpeg\ffprobe.exe"
+    $script:ffmpegDir = "$APP_DIR\ffmpeg"
     Ok "ffmpeg установлен в $APP_DIR\ffmpeg"
 }
 
 function Deps-Python {
     $pyDir = Join-Path $APP_DIR 'python3'
-    if (Test-Path "$pyDir\python3.exe") { Ok 'python3 установлен'; return }
-    # скрипты вызывают команду python3; если её нет — ставим embedded
-    # (свою копию: python.exe/python/py-лаунчер под именем python3 надёжно не работают)
-    if (Real-Exe 'python3') { Ok 'python3 найден в PATH'; return }
+
+    # 1) python3 в PATH и он рабочий
+    $py3 = Real-Exe 'python3'
+    if ($py3 -and (Test-Py3 $py3)) {
+        $script:pythonDir = Split-Path $py3 -Parent
+        $script:pythonExe = $py3
+        Ok "python3 найден в PATH: $py3"
+        if (-not (Test-PyPIL $py3)) { Warn 'Python есть, но нет модуля Pillow — обложки трека будут без обрезки. Поставь: python -m pip install pillow' }
+        Remove-Legacy-Python $pyDir
+        return
+    }
+
+    # 2) python в PATH (системный, не из Microsoft Store) — делаем shim python3
+    $py = Real-Exe 'python'
+    if ($py -and (Test-Py3 $py)) {
+        $script:pythonDir = Split-Path $py -Parent
+        $script:pythonExe = $py
+        New-Python3Shim $py
+        Ok "python найден в PATH: $py (shim python3 создан в $INSTALL_DIR)"
+        if (-not (Test-PyPIL $py)) { Warn 'Python есть, но нет модуля Pillow — обложки трека будут без обрезки. Поставь: python -m pip install pillow' }
+        Remove-Legacy-Python $pyDir
+        return
+    }
+
+    # 3) запасной вариант: embedded-python
+    if (Test-Path "$pyDir\python3.exe") { Ok 'python3 установлен (embedded)'; $script:pythonDir = $pyDir; return }
     $ver = '3.12.10'
     $arch = if ($IS_ARM64) { 'arm64' } else { 'amd64' }
     $url = "https://www.python.org/ftp/python/$ver/python-$ver-embed-$arch.zip"
     $zip = Join-Path $APP_DIR 'python.zip'
-    Info 'Качаю python (embedded, ~11 МБ)…'
+    Info 'python не найден в системе — качаю embedded (~11 МБ)…'
     if (-not (Fetch $url $zip)) { Err 'не удалось скачать python'; $script:depsFailed = $true; return }
     if (Test-Path $pyDir) { Remove-Item $pyDir -Recurse -Force }
     Expand-Archive -Force -Path $zip -DestinationPath $pyDir
@@ -131,19 +171,55 @@ function Deps-Python {
     $pth = Get-ChildItem $pyDir -Filter 'python*._pth' | Select-Object -First 1
     if ($pth) { Copy-Item $pth.FullName "$pyDir\python3._pth" -Force }
     Unblock "$pyDir\python3.exe"
+    $script:pythonDir = $pyDir
     Ok "python3 установлен в $pyDir"
 }
 
-# Bash, чтобы исполнять bash-скрипты: ищем Git Bash, иначе качаем PortableGit
+# python3-шимы в INSTALL_DIR: bash-скрипт (для Git Bash) и .cmd (для cmd.exe)
+function New-Python3Shim([string]$pythonExe) {
+    $pyFwd = $pythonExe -replace '\\', '/'
+    $bashShim = "#!/usr/bin/bash`nexec `"$pyFwd`" `"`$@`"`n"
+    [System.IO.File]::WriteAllText("$INSTALL_DIR\python3", $bashShim, (New-Object System.Text.UTF8Encoding($false)))
+    $cmdShim = "@echo off`r`n" + "`"$pythonExe`" %*`r`n"
+    [System.IO.File]::WriteAllText("$INSTALL_DIR\python3.cmd", $cmdShim, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# Удалить embedded-python, который ставили прошлые версии установщика (если есть системный)
+function Remove-Legacy-Python([string]$pyDir) {
+    if (Test-Path $pyDir) {
+        Remove-Item $pyDir -Recurse -Force -ErrorAction SilentlyContinue
+        Ok 'удалён старый embedded-python из ~\.local\share\dls'
+    }
+}
+
+# Bash, чтобы исполнять bash-скрипты: ищем Git Bash в системе, иначе качаем PortableGit
 function Deps-Bash {
     Info 'Ищу Git Bash…'
     $cands = @()
+
+    # 1) системный Git в PATH → <корень установки>\bin\bash.exe
+    $g = Get-Command git -ErrorAction SilentlyContinue
+    if ($g -and $g.Source -and ($g.Source -notlike '*WindowsApps*')) {
+        $root = Split-Path (Split-Path $g.Source -Parent) -Parent
+        if ($root) {
+            $cands += (Join-Path $root 'bin\bash.exe')
+            $cands += (Join-Path $root 'usr\bin\bash.exe')
+        }
+    }
+    # 2) стандартные места установки Git
     if ($env:ProgramFiles) { $cands += (Join-Path $env:ProgramFiles 'Git\bin\bash.exe') }
     if (${env:ProgramFiles(x86)}) { $cands += (Join-Path ${env:ProgramFiles(x86)} 'Git\bin\bash.exe') }
     if ($env:LOCALAPPDATA) { $cands += (Join-Path $env:LOCALAPPDATA 'Programs\Git\bin\bash.exe') }
-    foreach ($c in $cands) { if (Test-Path $c) { Ok "bash найден: $c"; return $c } }
+    foreach ($c in $cands) {
+        if (Test-Path $c) {
+            Remove-Legacy-Git
+            Ok "bash найден: $c"; return $c
+        }
+    }
+    # 3) bash.exe в PATH, но не заглушки WSL (System32 / WindowsApps)
     $b = Get-Command bash.exe -ErrorAction SilentlyContinue
-    if ($b -and $b.Source -and ($b.Source -notlike '*System32*')) {
+    if ($b -and $b.Source -and ($b.Source -notlike '*System32*') -and ($b.Source -notlike '*WindowsApps*')) {
+        Remove-Legacy-Git
         Ok "bash найден: $($b.Source)"; return $b.Source
     }
 
@@ -166,6 +242,19 @@ function Deps-Bash {
     Err 'PortableGit не распаковался'; $script:depsFailed = $true; return $null
 }
 
+# Удалить PortableGit, который ставили прошлые версии установщика (если есть системный bash)
+function Remove-Legacy-Git {
+    $gitDir = Join-Path $APP_DIR 'git'
+    if (Test-Path $gitDir) {
+        Remove-Item $gitDir -Recurse -Force -ErrorAction SilentlyContinue
+        Ok 'удалён старый PortableGit из ~\.local\share\dls'
+    }
+    if (Test-Path $APP_DIR) {
+        Get-ChildItem $APP_DIR -Filter 'PortableGit*.7z.exe' -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Ensure-Deps {
     if ($script:depsDone) { return $script:bashPath }
     Ensure-Curl
@@ -185,11 +274,10 @@ function Ensure-Deps {
 # --- установка утилит -----------------------------------------------------------
 
 function Make-Launcher([string]$name, [string]$bashPath) {
-    $py = Join-Path $APP_DIR 'python3'
-    $ff = Join-Path $APP_DIR 'ffmpeg'
+    $ff = if ($script:ffmpegDir) { $script:ffmpegDir } elseif (Test-Path "$APP_DIR\ffmpeg") { "$APP_DIR\ffmpeg" } else { $null }
     $pathPart = "$INSTALL_DIR;%PATH%"
-    if (Test-Path $py) { $pathPart = "$py;$pathPart" }
-    if (Test-Path $ff) { $pathPart = "$ff;$pathPart" }
+    if ($script:pythonDir -and (Test-Path $script:pythonDir)) { $pathPart = "$($script:pythonDir);$pathPart" }
+    if ($ff) { $pathPart = "$ff;$pathPart" }
     $content = "@echo off" + "`r`n" + "chcp 65001 >nul" + "`r`n" +
         "set `"PATH=$pathPart`"" + "`r`n" +
         "`"$bashPath`" --norc --noprofile `"$INSTALL_DIR\$name`" %*" + "`r`n"
@@ -200,8 +288,18 @@ function Make-Launcher([string]$name, [string]$bashPath) {
 
 function Install-Tool([string]$name, [string]$bashPath) {
     Info "Скачиваю $name…"
-    if (-not (Fetch "$RAW/$name" "$INSTALL_DIR\$name")) {
-        Err "не удалось скачать $RAW/$name"; return $false
+    # качаем во временный файл и потом переименовываем: при обрыве сети
+    # прежняя рабочая копия не портится
+    $tmpFile = Join-Path $INSTALL_DIR "$name.part"
+    if (-not (Fetch "$RAW/$name" $tmpFile)) {
+        Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
+        if (Test-Path "$INSTALL_DIR\$name") {
+            Warn "не удалось скачать свежую версию $name — использую существующую копию"
+        } else {
+            Err "не удалось скачать $RAW/$name"; return $false
+        }
+    } else {
+        Move-Item $tmpFile "$INSTALL_DIR\$name" -Force
     }
     Unblock "$INSTALL_DIR\$name"
     Make-Launcher $name $bashPath
@@ -227,10 +325,19 @@ function Setup-Bashrc {
     $bashrc = Join-Path $env:USERPROFILE '.bashrc'
     $marker = '# >>> dls PATH >>>'
     if ((Test-Path $bashrc) -and ((Get-Content $bashrc -Raw) -match [regex]::Escape($marker))) { Ok 'bashrc уже настроен'; return }
+    # PATH для Git Bash добавляет только то, что реально лежит на диске / в системе
+    if ($script:ffmpegDir) { $ffDir = $script:ffmpegDir } elseif (Test-Path "$APP_DIR\ffmpeg") { $ffDir = "$APP_DIR\ffmpeg" } else { $ffDir = $null }
     $block = "`r`n$marker`r`n" +
-        'export PATH="$HOME/.local/bin:$PATH"' + "`r`n" +
-        'export PATH="$HOME/.local/share/dls/ffmpeg:$HOME/.local/share/dls/python3:$PATH"' + "`r`n" +
-        '# <<< dls PATH <<<' + "`r`n"
+        'export PATH="$HOME/.local/bin:$PATH"' + "`r`n"
+    if ($ffDir) {
+        $ffFwd = $ffDir -replace '\\', '/'
+        $block += "export PATH=`"$ffFwd`:`$PATH`"" + "`r`n"
+    }
+    if ($script:pythonDir -and (Test-Path $script:pythonDir)) {
+        $pyFwd = $script:pythonDir -replace '\\', '/'
+        $block += "export PATH=`"$pyFwd`:`$PATH`"" + "`r`n"
+    }
+    $block += '# <<< dls PATH <<<' + "`r`n"
     if (Test-Path $bashrc) {
         # ASCII-строки, Add-Content без BOM-сюрпризов
         Add-Content -Path $bashrc -Value $block -Encoding Ascii
