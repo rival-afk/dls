@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="assets/banner.svg" alt="dls — terminal downloaders" width="520">
+</p>
+
+
 # dls
 
 Загрузчики мультимедиа для терминала: YouTube Music, TikTok, SoundCloud.
