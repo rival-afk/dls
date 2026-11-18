@@ -26,6 +26,140 @@ self_update() {
 }
 self_update
 
+# --- автообновление зависимостей (yt-dlp, jq, ffmpeg; отключается: DLS_LIBS_UPDATE=0) ---
+update_libs() {
+    [ "${DLS_LIBS_UPDATE:-1}" = "1" ] || return 0
+    local stamp now age last
+    stamp="$CACHE_DIR/.libs_check"
+    now=$(date +%s)
+    if [[ -f "$stamp" ]]; then
+        last=$(cat "$stamp" 2>/dev/null || echo 0)
+        case "$last" in (*[!0-9]*|'') last=0 ;; esac
+        age=$(( now - last ))
+        [ "$age" -lt 86400 ] && return 0
+    fi
+    echo "$now" > "$stamp" 2>/dev/null || true
+
+    # --- yt-dlp: самая критичная зависимость; сверяем с GitHub раз в день
+    if command -v yt-dlp >/dev/null 2>&1; then
+        local ytdlp_now latest
+        ytdlp_now=$(yt-dlp --version 2>/dev/null || true)
+        latest=$(curl -fsSL --max-time 10 "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest" 2>/dev/null \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name",""))' 2>/dev/null || true)
+        if [[ -n "$latest" && "$latest" != "$ytdlp_now" ]]; then
+            echo "⟳ yt-dlp: ${ytdlp_now:-?} → $latest"
+            if yt-dlp -U >/dev/null 2>&1; then
+                echo "✓ yt-dlp обновлён до $(yt-dlp --version 2>/dev/null || echo "$latest")"
+            elif python3 -m pip install --user -q --upgrade yt-dlp >/dev/null 2>&1; then
+                echo "✓ yt-dlp обновлён через pip"
+            elif python3 -m pip install --user -q --upgrade --break-system-packages yt-dlp >/dev/null 2>&1; then
+                echo "✓ yt-dlp обновлён через pip (--break-system-packages)"
+            elif command -v pkg >/dev/null 2>&1; then
+                pkg upgrade -y yt-dlp >/dev/null 2>&1 && echo "✓ yt-dlp обновлён через pkg" \
+                    || echo "⚠ не удалось обновить yt-dlp (попробуй: yt-dlp -U)" >&2
+            elif command -v brew >/dev/null 2>&1; then
+                brew upgrade yt-dlp >/dev/null 2>&1 && echo "✓ yt-dlp обновлён через brew" \
+                    || echo "⚠ не удалось обновить yt-dlp (попробуй: yt-dlp -U)" >&2
+            else
+                echo "⚠ не удалось обновить yt-dlp (попробуй: yt-dlp -U)" >&2
+            fi
+        fi
+    fi
+
+    # --- jq: pkg/brew, либо статический бинарь (если текущий можно перезаписать)
+    if command -v jq >/dev/null 2>&1; then
+        local jq_now jq_latest
+        jq_now=$(jq --version 2>/dev/null | sed 's/^jq-//' || true)
+        jq_latest=$(curl -fsSL --max-time 10 "https://api.github.com/repos/jqlang/jq/releases/latest" 2>/dev/null \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name",""))' 2>/dev/null || true)
+        jq_latest=${jq_latest#jq-}
+        if [[ -n "$jq_latest" && -n "$jq_now" && "$jq_latest" != "$jq_now" ]]; then
+            if command -v pkg >/dev/null 2>&1; then
+                pkg upgrade -y jq >/dev/null 2>&1 && echo "✓ jq обновлён через pkg" || true
+            elif command -v brew >/dev/null 2>&1; then
+                brew upgrade jq >/dev/null 2>&1 && echo "✓ jq обновлён через brew" || true
+            else
+                local jq_bin asset new
+                jq_bin=$(command -v jq)
+                asset=""
+                case "$(uname -s)" in
+                    Linux*)
+                        case "$(uname -m)" in
+                            aarch64|arm64) asset="jq-linux-arm64" ;;
+                            *)             asset="jq-linux-amd64" ;;
+                        esac
+                        ;;
+                    Darwin*)                asset="jq-macos-amd64" ;;
+                    MINGW*|MSYS*|CYGWIN*)   asset="jq-windows-amd64.exe" ;;
+                esac
+                if [[ -n "$asset" && -w "$jq_bin" ]]; then
+                    new="${jq_bin}.new.$$"
+                    if curl -fsSL --max-time 30 "https://github.com/jqlang/jq/releases/latest/download/$asset" -o "$new" 2>/dev/null; then
+                        chmod +x "$new" 2>/dev/null
+                        if mv "$new" "$jq_bin" 2>/dev/null; then
+                            echo "✓ jq обновлён до $("$jq_bin" --version 2>/dev/null || echo "$jq_latest")"
+                        else
+                            rm -f "$new"
+                        fi
+                    else
+                        rm -f "$new"
+                    fi
+                else
+                    echo "⚠ jq $jq_latest доступен — текущий только для чтения/системный, обнови вручную." >&2
+                fi
+            fi
+        fi
+    fi
+
+    # --- ffmpeg: обновляем только статическую сборку из нашей папки (раз в неделю)
+    local ff_dir="$HOME/.local/share/dls/ffmpeg"
+    local ff_bin=""
+    [[ -f "$ff_dir/ffmpeg.exe" ]] && ff_bin="$ff_dir/ffmpeg.exe"
+    [[ -z "$ff_bin" && -f "$ff_dir/ffmpeg" ]] && ff_bin="$ff_dir/ffmpeg"
+    if [[ -n "$ff_bin" ]]; then
+        local ff_stamp ff_now ff_last
+        ff_stamp="$CACHE_DIR/.ffmpeg_check"
+        ff_now=$(date +%s)
+        ff_last=$(cat "$ff_stamp" 2>/dev/null || echo 0)
+        case "$ff_last" in (*[!0-9]*|'') ff_last=0 ;; esac
+        if (( ff_now - ff_last >= 604800 )); then
+            echo "$ff_now" > "$ff_stamp" 2>/dev/null || true
+            echo "⟳ Обновляю ffmpeg (статическая сборка BtbN)…"
+            local zip tmp bin f dest
+            zip="$CACHE_DIR/ffmpeg.zip"
+            tmp="$CACHE_DIR/_ffmpeg_tmp"
+            if curl -fsSL --max-time 600 "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip" -o "$zip" 2>/dev/null; then
+                rm -rf "$tmp"; mkdir -p "$tmp"
+                if command -v powershell.exe >/dev/null 2>&1; then
+                    powershell.exe -NoProfile -Command "Expand-Archive -Force '$zip' '$tmp'" >/dev/null 2>&1 || true
+                elif command -v unzip >/dev/null 2>&1; then
+                    unzip -qo "$zip" -d "$tmp" >/dev/null 2>&1 || true
+                fi
+                bin=$(find "$tmp" -maxdepth 3 -type d -name bin 2>/dev/null | head -n 1)
+                if [[ -n "$bin" ]]; then
+                    for f in "$bin"/*; do
+                        dest="$ff_dir/${f##*/}"
+                        mv -f "$dest" "$dest.old" 2>/dev/null || true
+                        if ! cp -f "$f" "$dest" 2>/dev/null; then
+                            mv -f "$dest.old" "$dest" 2>/dev/null || true
+                        else
+                            rm -f "$dest.old"
+                        fi
+                    done
+                    echo "✓ ffmpeg обновлён"
+                else
+                    echo "⚠ не удалось распаковать ffmpeg" >&2
+                fi
+                rm -rf "$tmp"; rm -f "$zip"
+            else
+                echo "⚠ не удалось скачать ffmpeg" >&2
+            fi
+        fi
+    fi
+}
+update_libs
+
+
 show_help() {
     cat <<'EOF'
 scd — загрузчик треков с SoundCloud
