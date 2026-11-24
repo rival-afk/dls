@@ -27,6 +27,38 @@ self_update() {
 self_update
 
 # --- автообновление зависимостей (yt-dlp, jq, ffmpeg; отключается: DLS_LIBS_UPDATE=0) ---
+
+# yt-dlp нужна curl_cffi для impersonation (обход JS-челленджей на YouTube и др.).
+# Спрашиваем сам yt-dlp (не python import), чтобы не ругаться зря на standalone-
+# сборки, где зависимость уже вшита в бинарник. Отключается: DLS_LIBS_UPDATE=0.
+# yt-dlp перечисляет цели curl_cffi и когда её нет — с пометкой "(unavailable)".
+# Нас интересует только реально доступная цель (строка без пометки).
+impersonation_ready() {
+    yt-dlp --list-impersonate-targets 2>/dev/null | grep -i 'curl_cffi' | grep -qv 'unavailable'
+}
+
+ensure_impersonation() {
+    [ "${DLS_LIBS_UPDATE:-1}" = "1" ] || return 0
+    command -v yt-dlp >/dev/null 2>&1 || return 0
+    local stamp="$CACHE_DIR/.impersonate_ok"
+    [[ -f "$stamp" ]] && return 0
+    if impersonation_ready; then
+        touch "$stamp" 2>/dev/null || true
+        return 0
+    fi
+    echo "⟳ yt-dlp: нет impersonation (curl_cffi) — ставлю зависимость…"
+    python3 -m pip install --user -q --upgrade curl_cffi >/dev/null 2>&1 \
+        || python3 -m pip install --user -q --upgrade --break-system-packages curl_cffi >/dev/null 2>&1 \
+        || true
+    if impersonation_ready; then
+        echo "✓ impersonation доступен (curl_cffi)"
+        touch "$stamp" 2>/dev/null || true
+    else
+        echo "⚠ curl_cffi не установлен — часть сайтов может падать на JS-челлендже (pip install curl_cffi)" >&2
+    fi
+}
+ensure_impersonation
+
 update_libs() {
     [ "${DLS_LIBS_UPDATE:-1}" = "1" ] || return 0
     local stamp now age last

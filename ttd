@@ -35,6 +35,40 @@ self_update() {
 self_update
 
 # --- автообновление зависимостей (yt-dlp, jq, ffmpeg; отключается: DLS_LIBS_UPDATE=0) ---
+
+# yt-dlp нужна curl_cffi для impersonation (обход JS-челленджей TikTok/YouTube).
+# Без неё TikTok падает с "no impersonate target is available", а затем и с
+# "Unable to extract universal data for rehydration" — обновление версии yt-dlp
+# само по себе проблему не лечит. Спрашиваем сам yt-dlp (не python import), чтобы
+# не ругаться зря на standalone-сборки, где зависимость уже вшита в бинарник.
+# yt-dlp перечисляет цели curl_cffi и когда её нет — с пометкой "(unavailable)".
+# Нас интересует только реально доступная цель (строка без пометки).
+impersonation_ready() {
+    yt-dlp --list-impersonate-targets 2>/dev/null | grep -i 'curl_cffi' | grep -qv 'unavailable'
+}
+
+ensure_impersonation() {
+    [ "${DLS_LIBS_UPDATE:-1}" = "1" ] || return 0
+    command -v yt-dlp >/dev/null 2>&1 || return 0
+    local stamp="$CACHE_DIR/.impersonate_ok"
+    [[ -f "$stamp" ]] && return 0
+    if impersonation_ready; then
+        touch "$stamp" 2>/dev/null || true
+        return 0
+    fi
+    echo "⟳ yt-dlp: нет impersonation (curl_cffi) — ставлю зависимость…"
+    python3 -m pip install --user -q --upgrade curl_cffi >/dev/null 2>&1 \
+        || python3 -m pip install --user -q --upgrade --break-system-packages curl_cffi >/dev/null 2>&1 \
+        || true
+    if impersonation_ready; then
+        echo "✓ impersonation доступен (curl_cffi)"
+        touch "$stamp" 2>/dev/null || true
+    else
+        echo "⚠ curl_cffi не установлен — TikTok может падать на JS-челлендже (pip install curl_cffi)" >&2
+    fi
+}
+ensure_impersonation
+
 update_libs() {
     [ "${DLS_LIBS_UPDATE:-1}" = "1" ] || return 0
     local stamp now age last
@@ -288,6 +322,26 @@ clean_covers() {
     rm -f "$CACHE_DIR/.covers_before"
 }
 
+# TikTok периодически отдаёт страницу без universal data после JS-челленджа —
+# это флап, а не постоянная ошибка (иногда тот же ролик качается со 2-й попытки).
+run_ytdlp() {
+    local url="$1"; shift
+    local attempt max_attempts=1 rc=0
+    case "$url" in
+        *tiktok.com*|*tiktokv.com*) max_attempts=3 ;;
+    esac
+    for (( attempt=1; attempt<=max_attempts; attempt++ )); do
+        rc=0
+        "$@" "$url" || rc=$?
+        (( rc == 0 )) && return 0
+        if (( attempt < max_attempts )); then
+            echo "⟳ Повтор ${attempt}: TikTok иногда отдаёт страницу без данных…" >&2
+            sleep 2
+        fi
+    done
+    return "$rc"
+}
+
 download_music() {
     local url="$1"
     echo
@@ -307,7 +361,7 @@ download_music() {
     [[ -f "$COOKIES_FILE" ]] && args+=(--cookies "$COOKIES_FILE")
     snapshot_covers
     touch "$CACHE_DIR/.marker"
-    if ! yt-dlp "${args[@]}" "$url"; then
+    if ! run_ytdlp "$url" yt-dlp "${args[@]}"; then
         echo "✖ Не удалось скачать (mp3): $url" >&2
         clean_covers
         return 1
@@ -360,7 +414,7 @@ download_video() {
     [[ -f "$COOKIES_FILE" ]] && args+=(--cookies "$COOKIES_FILE")
     snapshot_covers
     touch "$CACHE_DIR/.marker"
-    if ! yt-dlp "${args[@]}" "$url"; then
+    if ! run_ytdlp "$url" yt-dlp "${args[@]}"; then
         echo "✖ Не удалось скачать (mp4): $url" >&2
         clean_covers
         return 1
